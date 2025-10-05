@@ -1,0 +1,231 @@
+Prompt — ExoDetect: Multi-class Exoplanet Classifier (High-quality, reproducible)
+
+Use this prompt to (a) reproduce the full project, (b) instruct an LLM/assistant to implement it, or (c) hand to an engineer. It assumes the provided dataset cumulative_2025.10.03_23.58.46.csv and aims to produce a production-ready model + Streamlit app that classifies objects into Confirmed / Candidate / False Positive with special attention to identifying true exoplanets (high precision & recall on the Confirmed class).
+
+Short description (one line)
+
+Train a high-performance multi-class tabular classifier (XGBoost/LightGBM ensemble) on NASA’s cumulative_2025.10.03_23.58.46.csv to predict object disposition (Confirmed / Candidate / False Positive), produce model artifacts and a responsive Streamlit app with per-row analytics, SHAP explanations, and deployment assets (Dockerfile, requirements).
+
+Data (inputs)
+
+Dataset path: /mnt/data/cumulative_2025.10.03_23.58.46.csv (CSV; skip lines beginning with # if present).
+
+Label mapping (target): map disposition-like columns to three classes:
+
+Confirmed ← contains CONFIRMED, CP, KP, etc.
+
+Candidate ← contains CANDIDATE, PC, PC?, PC+, etc.
+
+False Positive ← contains FALSE, FP, REFUTED, etc.
+
+Expected feature candidates (use if present): koi_period, koi_duration, koi_prad, koi_depth, koi_snr, koi_teq, koi_insol, koi_srad, koi_kepmag, st_teff, st_rad, etc. (Select numeric columns matching transit & stellar properties.)
+
+Preprocessing & feature engineering
+
+Read CSV: pd.read_csv(path, comment='#', low_memory=False).
+
+Detect label column: search columns for keywords dispos, disp, status, koi_disposition, tfopwg_disp.
+
+Standardize labels (function): return 'Confirmed'|'Candidate'|'False Positive'|np.nan.
+
+Feature selection:
+
+Keep numeric features whose column names contain substrings: period,duration,prad,depth,snr,mes,teff,insol,mag,flux,impact,rad.
+
+If fewer than 6 features matched, add top numeric columns until you have 6–30 features.
+
+Row filtering:
+
+Drop rows with missing labels.
+
+Require each row to have at least 3 non-null features; drop others.
+
+Missing values:
+
+Use SimpleImputer(strategy='median') for numeric missing values.
+
+Transforms:
+
+Log-transform highly skewed positive features (e.g., period, depth, insol) where appropriate: x = np.log1p(x).
+
+Standardize numeric features with StandardScaler() after imputation.
+
+Class imbalance:
+
+Compute class weights = total_samples / (n_classes * count_class) and use as sample_weight (preferred for XGBoost/LightGBM) or class_weight='balanced' for scikit-learn models.
+
+Optionally test SMOTE only for exploratory improvements (be careful with leakage).
+
+Feature importance: compute permutation importance + SHAP on final model.
+
+Model: recommended (best for tabular)
+
+Primary: XGBoost (xgboost.XGBClassifier) or LightGBM (lightgbm.LGBMClassifier) for multiclass:
+
+objective: multi:softprob (XGBoost) or multiclass (LightGBM)
+
+eval_metric: mlogloss and monitor per-class metrics on a validation set
+
+use sample_weight derived from class weights to emphasize Confirmed class if needed
+
+Baseline: RandomForest with class_weight='balanced' (fast baseline)
+
+Ensemble: optionally stack XGBoost + RandomForest with a simple logistic meta-learner.
+
+Hyperparameter search (practical)
+
+Use StratifiedKFold (k=5) or StratifiedShuffleSplit. Tune for best Confirmed recall while controlling precision.
+
+XGBoost param grid (example):
+
+n_estimators: [100, 300, 600]
+
+max_depth: [4, 6, 8]
+
+learning_rate: [0.01, 0.05, 0.1]
+
+subsample: [0.6, 0.8, 1.0]
+
+colsample_bytree: [0.6, 0.8, 1.0]
+
+reg_lambda: [1, 5, 10]
+
+Use Bayesian optimization (Optuna) or RandomizedSearchCV for speed.
+
+Training & evaluation protocol
+
+Split: train_test_split(..., stratify=y, test_size=0.25, random_state=42) then split test into validation/test (50/50) OR use cross-val.
+
+Metrics:
+
+Primary focus: precision and recall for Confirmed.
+
+Also report per-class precision/recall/F1, macro F1, weighted F1, ROC AUC (one-vs-rest if desired).
+
+Outputs:
+
+Confusion matrix
+
+Classification report (scikit-learn)
+
+Calibration curve (optional)
+
+SHAP summary plot and per-row explanation
+
+Model selection: choose model maximizing a combined score weighted toward Confirmed recall (for example 0.6 * recall_confirmed + 0.4 * precision_confirmed) while maintaining reasonable macro F1.
+
+Artifacts to save
+
+models/preprocessor.joblib — Pipeline (imputer + optional log transforms wrapper + scaler).
+
+models/xgb_model.joblib — trained XGBoost model (or model.joblib).
+
+models/feature_list.json — ordered list of features used.
+
+models/label_encoder.json — class order list.
+
+models/report.json — classification report + confusion matrix + training metadata.
+
+notebooks/training_notebook.ipynb — reproducible notebook for experiments.
+
+Streamlit web app (requirements)
+
+Behavior:
+
+Loads preprocessor + model from ./models/ (auto-discover).
+
+UI: Upload CSV OR manual entry of features.
+
+Validates uploaded CSV columns against feature_list.json and shows helpful errors.
+
+For each row: show predicted class, prediction probabilities, SHAP force plot (or bar), and per-feature distribution plots (boxplot & value marker).
+
+Sidebar: model metrics (report.json), feature importance plot, option to set probability thresholds to favor precision or recall for Confirmed.
+
+Allow user to download predictions CSV.
+
+Admin: button to retrain model from uploaded labeled CSV with caution and logging (optional).
+
+Performance:
+
+Use st.cache_resource for loading model artifacts.
+
+Avoid expensive recomputation inside UI callbacks.
+
+SHAP interpretability
+
+Use shap.TreeExplainer for XGBoost/LightGBM.
+
+Save global SHAP summary plot to artifacts/shap_summary.png.
+
+For each selected row in the UI generate a SHAP force plot or waterfall explanation.
+
+Deployment assets
+
+requirements.txt with pinned versions (e.g., xgboost>=1.7, scikit-learn>=1.2, streamlit>=1.20).
+
+Dockerfile (Python 3.10 slim) with EXPOSE 8501.
+
+README.md with run & deploy instructions and sample input file sample_input.csv.
+
+Reproducible commands (copy/paste)
+# train
+python scripts/train.py --csv "/mnt/data/cumulative_2025.10.03_23.58.46.csv" --out "./models" --model xgboost
+
+# run app locally
+python -m venv venv
+source venv/bin/activate        # or .\venv\Scripts\Activate.ps1 on Windows
+pip install -r requirements.txt
+streamlit run app/streamlit_app.py --server.port=8501
+
+# build docker
+docker build -t exodetect-app .
+docker run -p 8501:8501 exodetect-app
+
+Example scripts/train.py (concise spec)
+
+Accept CLI args: --csv, --out, --model (xgboost|lgbm|rf), --seed.
+
+Implements preprocessing, feature selection, label mapping, stratified split, model fit, evaluation, artifact saving.
+
+If --model xgboost use sample_weight derived from class weights.
+
+Save feature_list.json, label_encoder.json, report.json plus model and preprocessor joblibs.
+
+Expected targets & checkpoints
+
+Baseline target: Confirmed recall ≥ 0.80 and Confirmed precision ≥ 0.80 on held-out test (matching earlier baseline performance).
+
+If baseline fails, iterate with:
+
+feature engineering (log transforms, feature ratios),
+
+tuned XGBoost, class weighting adjustments,
+
+adding vetting flags or engineered features (centroid offset, odd/even depth differences) if available.
+
+Deliverables
+
+models/ artifacts (joblibs + jsons).
+
+app/streamlit_app.py (production-ready and using st.cache_resource).
+
+Dockerfile, requirements.txt, README.md.
+
+notebooks/training_notebook.ipynb with experiments, plots (ROC, confusion, SHAP).
+
+sample_input.csv (5–10 sample rows).
+
+CI script (optional) to run unit tests (model loading, inference on sample data).
+
+Copy-pasteable LLM prompt (one block)
+
+I have the file /mnt/data/cumulative_2025.10.03_23.58.46.csv (NASA cumulative exoplanet catalog). Build a reproducible end-to-end project that: (1) trains a multi-class classifier (labels: Confirmed / Candidate / False Positive) optimized for identifying Confirmed planets (high recall and precision), (2) uses XGBoost or LightGBM as the primary model and RandomForest as baseline, (3) includes preprocessing (median imputation, optional log transforms, standard scaling), (4) handles class imbalance with sample weights, (5) executes stratified CV and hyperparameter tuning (suggest Optuna or RandomizedSearch), (6) outputs saved artifacts models/preprocessor.joblib, models/model.joblib, models/feature_list.json, models/label_encoder.json, models/report.json, (7) builds a responsive Streamlit app at app/streamlit_app.py that loads artifacts via st.cache_resource, accepts CSV upload or manual input, shows predictions & probabilities, per-row SHAP explanations and feature distribution visuals, (8) includes Dockerfile, requirements.txt, and a training script scripts/train.py. Provide the full implementation plan, exact CLI commands (train, run, docker), hyperparameter search space, evaluation metrics, and example code snippets for loading model + running inference. Also provide recommended thresholds and a calibration step. Output code and configuration only — no extra commentary.
+
+If you want, I can now:
+
+generate the exact scripts/train.py and app/streamlit_app.py files per this prompt, or
+
+produce an Optuna hyperparameter tuning notebook, or
+
+create a GitHub-ready README + CI workflow.
