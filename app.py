@@ -21,6 +21,10 @@ except ImportError:
 from utils.data_preprocessing import ExoplanetPreprocessor
 from utils.model_training import ExoplanetClassifier
 from utils.shap_utils import SHAPExplainer
+from utils.hyperparameter_tuning import HyperparameterOptimizer
+from utils.ensemble_models import EnsembleClassifier
+from utils.calibration_utils import ModelCalibration
+from utils.feature_engineering import ExoplanetFeatureEngineer
 
 # Page configuration
 st.set_page_config(
@@ -67,6 +71,19 @@ def main():
     page = st.sidebar.selectbox("Choose a page", 
                                ["Train Model", "Make Predictions", "Model Performance", "Feature Analysis"])
     
+    # Show model info in sidebar if model exists
+    st.sidebar.divider()
+    artifacts = load_model_artifacts()
+    if artifacts and 'report' in artifacts:
+        st.sidebar.markdown("### 📊 Current Model")
+        report = artifacts['report']
+        st.sidebar.metric("Overall Accuracy", f"{report['overall_accuracy']:.1%}")
+        if 'training_info' in report:
+            st.sidebar.caption(f"Model: {report['training_info'].get('model_type', 'N/A')}")
+            st.sidebar.caption(f"Features: {report['training_info'].get('n_features', 'N/A')}")
+    else:
+        st.sidebar.info("No model trained yet")
+    
     if page == "Train Model":
         train_model_page()
     elif page == "Make Predictions":
@@ -108,11 +125,44 @@ def train_model_page():
     # Training parameters
     col1, col2, col3 = st.columns(3)
     with col1:
-        model_type = st.selectbox("Model Type", ["XGBoost", "LightGBM", "Random Forest"])
+        model_type = st.selectbox("Model Type", ["XGBoost", "LightGBM", "Random Forest", "Ensemble (Stacking)"])
     with col2:
         test_size = st.slider("Test Size", 0.1, 0.4, 0.25)
     with col3:
         random_state = st.number_input("Random State", value=42, min_value=1)
+    
+    # Advanced options
+    st.markdown("### ⚙️ Advanced Options")
+    
+    # Feature Engineering
+    use_feature_engineering = st.checkbox("Enable Feature Engineering", 
+                                          help="Create derived features (ratios, interactions) for improved performance")
+    
+    if use_feature_engineering:
+        fe_col1, fe_col2 = st.columns(2)
+        with fe_col1:
+            include_ratios = st.checkbox("Ratio Features", value=True, 
+                                         help="Create ratio features (e.g., planet/star radius)")
+            include_interactions = st.checkbox("Interaction Features", value=True,
+                                              help="Create multiplicative interactions")
+        with fe_col2:
+            include_differences = st.checkbox("Difference Features", value=True,
+                                             help="Create difference features from error bounds")
+            include_polynomial = st.checkbox("Polynomial Features", value=False,
+                                            help="Create polynomial features (degree 2)")
+    
+    # Hyperparameter optimization
+    use_hp_optimization = st.checkbox("Enable Hyperparameter Optimization", 
+                                      help="Use RandomizedSearchCV to find optimal hyperparameters (slower but better performance)")
+    
+    if use_hp_optimization:
+        hp_col1, hp_col2 = st.columns(2)
+        with hp_col1:
+            n_iter = st.slider("Number of iterations", 10, 50, 20, 
+                             help="Number of parameter settings sampled")
+        with hp_col2:
+            cv_folds = st.slider("CV folds", 3, 10, 5,
+                               help="Number of cross-validation folds")
     
     if st.button("Train Model", type="primary"):
         with st.spinner("Training model... This may take a few minutes."):
@@ -132,48 +182,298 @@ def train_model_page():
                 st.info(f"Features selected: {len(feature_names)}")
                 st.info(f"Class distribution: {dict(pd.Series(y).value_counts())}")
                 
-                # Train model
-                st.info("Training classifier...")
-                results = classifier.train_and_evaluate(X, y, test_size=test_size, random_state=random_state)
+                # Feature engineering if enabled
+                if use_feature_engineering:
+                    st.warning("⚠️ Feature engineering is currently disabled to prevent data leakage. This feature will be re-implemented in a future update.")
+                    # TODO: Refactor feature engineering to apply only on training data after train/test split
+                    # to prevent data leakage
                 
-                # Save artifacts
+                # Encode labels consistently before any training
+                from sklearn.preprocessing import LabelEncoder
+                label_encoder = LabelEncoder()
+                y_encoded = label_encoder.fit_transform(y)
+                
+                # Check if ensemble model is selected
+                if model_type == "Ensemble (Stacking)":
+                    st.info("🎯 Training ensemble model with stacking...")
+                    from sklearn.model_selection import train_test_split
+                    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+                    
+                    # Split data with encoded labels
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
+                    )
+                    
+                    # Create and train ensemble
+                    ensemble = EnsembleClassifier(random_state=random_state)
+                    
+                    # Evaluate base models first
+                    st.info("Evaluating base models...")
+                    base_results = ensemble.evaluate_base_models(X_train, y_train, cv=5)
+                    
+                    with st.expander("Base Model Performance"):
+                        for name, result in base_results.items():
+                            st.write(f"**{name}**: {result['mean_score']:.4f} (+/- {result['std_score']:.4f})")
+                    
+                    # Train stacking ensemble
+                    model = ensemble.train(X_train, y_train, label_encoder)
+                    
+                    # Evaluate on test set
+                    y_pred = ensemble.predict(X_test)
+                    accuracy = accuracy_score(y_test, y_pred)
+                    
+                    target_names = list(label_encoder.classes_)
+                    class_report = classification_report(
+                        y_test, y_pred, 
+                        target_names=target_names,
+                        output_dict=True,
+                        zero_division=0
+                    )
+                    conf_matrix = confusion_matrix(y_test, y_pred)
+                    
+                    feature_importance = ensemble.get_feature_importance()
+                    
+                    results = {
+                        'model': model,
+                        'label_encoder': label_encoder,
+                        'accuracy': accuracy,
+                        'classification_report': class_report,
+                        'confusion_matrix': conf_matrix,
+                        'feature_importance': feature_importance,
+                        'X_test': X_test,
+                        'y_test': y_test,
+                        'y_pred': y_pred,
+                        'hp_optimization': {'enabled': False},
+                        'ensemble_info': {
+                            'type': 'stacking',
+                            'base_models': base_results
+                        }
+                    }
+                # Hyperparameter optimization if enabled (not for ensemble)
+                elif use_hp_optimization:
+                    st.info("🔍 Optimizing hyperparameters with cross-validation...")
+                    from sklearn.model_selection import train_test_split
+                    
+                    # Split data for optimization (labels already encoded above)
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
+                    )
+                    
+                    # Run hyperparameter optimization
+                    optimizer = HyperparameterOptimizer(
+                        model_type=model_type.lower().replace(" ", ""),
+                        n_iter=n_iter,
+                        cv=cv_folds,
+                        random_state=random_state
+                    )
+                    
+                    hp_results = optimizer.optimize(X_train, y_train, scoring='f1_macro')
+                    
+                    # Show optimization results
+                    st.success(f"✅ Best CV Score: {hp_results['best_score']:.4f}")
+                    with st.expander("Best Parameters"):
+                        st.json(hp_results['best_params'])
+                    
+                    # Use optimized model
+                    classifier.model = hp_results['best_model']
+                    classifier.label_encoder = label_encoder
+                    
+                    # Evaluate on test set
+                    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+                    y_pred = classifier.model.predict(X_test)
+                    accuracy = accuracy_score(y_test, y_pred)
+                    
+                    target_names = list(label_encoder.classes_)
+                    class_report = classification_report(
+                        y_test, y_pred, 
+                        target_names=target_names,
+                        output_dict=True,
+                        zero_division=0
+                    )
+                    conf_matrix = confusion_matrix(y_test, y_pred)
+                    
+                    feature_importance = None
+                    if hasattr(classifier.model, 'feature_importances_'):
+                        feature_importance = classifier.model.feature_importances_
+                    
+                    results = {
+                        'model': classifier.model,
+                        'label_encoder': label_encoder,
+                        'accuracy': accuracy,
+                        'classification_report': class_report,
+                        'confusion_matrix': conf_matrix,
+                        'feature_importance': feature_importance,
+                        'X_test': X_test,
+                        'y_test': y_test,
+                        'y_pred': y_pred,
+                        'hp_optimization': {
+                            'enabled': True,
+                            'best_params': hp_results['best_params'],
+                            'best_cv_score': hp_results['best_score']
+                        }
+                    }
+                else:
+                    # Train model normally with encoded labels
+                    st.info("Training classifier...")
+                    from sklearn.model_selection import train_test_split
+                    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+                    
+                    # Split data
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
+                    )
+                    
+                    # Train using the classifier's create_model and train logic
+                    classifier.label_encoder = label_encoder
+                    n_classes = len(label_encoder.classes_)
+                    class_weights_dict = classifier.calculate_class_weights(y_train)
+                    classifier.create_model(n_classes, class_weights_dict)
+                    
+                    # Train model with sample weights
+                    if classifier.model_type in ['xgboost']:
+                        sample_weights = classifier.calculate_sample_weights(y_train, class_weights_dict)
+                        classifier.model.fit(X_train, y_train, sample_weight=sample_weights)
+                    else:
+                        classifier.model.fit(X_train, y_train)
+                    
+                    # Make predictions
+                    y_pred = classifier.model.predict(X_test)
+                    
+                    # Calculate metrics
+                    accuracy = accuracy_score(y_test, y_pred)
+                    target_names = list(label_encoder.classes_)
+                    class_report = classification_report(
+                        y_test, y_pred, 
+                        target_names=target_names,
+                        output_dict=True,
+                        zero_division=0
+                    )
+                    conf_matrix = confusion_matrix(y_test, y_pred)
+                    
+                    feature_importance = None
+                    if hasattr(classifier.model, 'feature_importances_'):
+                        feature_importance = classifier.model.feature_importances_
+                    
+                    results = {
+                        'model': classifier.model,
+                        'label_encoder': label_encoder,
+                        'accuracy': accuracy,
+                        'classification_report': class_report,
+                        'confusion_matrix': conf_matrix,
+                        'feature_importance': feature_importance,
+                        'X_test': X_test,
+                        'y_test': y_test,
+                        'y_pred': y_pred,
+                        'hp_optimization': {'enabled': False}
+                    }
+                
+                # Calibration analysis
+                st.info("📊 Performing calibration analysis...")
+                try:
+                    calibration = ModelCalibration(
+                        results['model'], 
+                        results['X_test'], 
+                        results['y_test'],
+                        list(results['label_encoder'].classes_)
+                    )
+                    
+                    # Get threshold recommendations
+                    threshold_recs = calibration.get_threshold_recommendations()
+                    results['calibration_thresholds'] = threshold_recs
+                    
+                    st.success("✅ Calibration analysis complete")
+                except Exception as e:
+                    st.warning(f"Calibration analysis skipped: {str(e)}")
+                    results['calibration_thresholds'] = {}
+                
+                # Save artifacts with versioning
                 os.makedirs("models", exist_ok=True)
+                os.makedirs("models/versions", exist_ok=True)
                 
-                # Save model and preprocessor
-                joblib.dump(classifier.model, "models/model.joblib")
+                # Create version info
+                import datetime
+                version_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                version_info = {
+                    'timestamp': version_timestamp,
+                    'model_type': model_type,
+                    'accuracy': results['accuracy'],
+                    'n_features': len(feature_names),
+                    'feature_engineering': use_feature_engineering if 'use_feature_engineering' in locals() else False,
+                    'hyperparameter_optimization': use_hp_optimization if 'use_hp_optimization' in locals() else False
+                }
+                
+                # Save current version as active
+                joblib.dump(results['model'], "models/model.joblib")
                 joblib.dump(preprocessor, "models/preprocessor.joblib")
+                joblib.dump({'X_test': results['X_test'], 'y_test': results['y_test']}, "models/test_data.joblib")
                 
-                # Save feature list and labels
+                # Prepare report data before saving
+                report_data = {
+                    'overall_accuracy': results['accuracy'],
+                    'classification_report': results['classification_report'],
+                    'confusion_matrix': results['confusion_matrix'].tolist(),
+                    'feature_importance': results['feature_importance'].tolist() if results['feature_importance'] is not None else None,
+                    'calibration_thresholds': results.get('calibration_thresholds', {}),
+                    'training_info': {
+                        'model_type': model_type,
+                        'test_size': test_size,
+                        'random_state': random_state,
+                        'n_features': len(feature_names),
+                        'n_samples': len(X),
+                        'hyperparameter_optimization': results.get('hp_optimization', {'enabled': False})
+                    }
+                }
+                
+                # Save versioned copy with complete artifacts
+                version_dir = f"models/versions/v_{version_timestamp}"
+                os.makedirs(version_dir, exist_ok=True)
+                joblib.dump(results['model'], f"{version_dir}/model.joblib")
+                joblib.dump(preprocessor, f"{version_dir}/preprocessor.joblib")
+                
+                # Save version-specific report
+                with open(f"{version_dir}/report.json", 'w') as f:
+                    json.dump(report_data, f, indent=2)
+                
+                # Save feature list for this version
+                with open(f"{version_dir}/feature_list.json", 'w') as f:
+                    json.dump(feature_names, f)
+                
+                # Save version metadata
+                with open(f"{version_dir}/version_info.json", 'w') as f:
+                    json.dump(version_info, f, indent=2)
+                
+                # Update version history
+                history_file = "models/version_history.json"
+                if os.path.exists(history_file):
+                    with open(history_file, 'r') as f:
+                        history = json.load(f)
+                else:
+                    history = []
+                
+                history.append(version_info)
+                
+                with open(history_file, 'w') as f:
+                    json.dump(history, f, indent=2)
+                
+                # Save feature list and labels for active model
                 with open("models/feature_list.json", 'w') as f:
                     json.dump(feature_names, f)
                 
                 with open("models/label_encoder.json", 'w') as f:
                     json.dump(list(results['label_encoder'].classes_), f)
                 
-                # Save performance report
-                report_data = {
-                    'overall_accuracy': results['accuracy'],
-                    'classification_report': results['classification_report'],
-                    'confusion_matrix': results['confusion_matrix'].tolist(),
-                    'feature_importance': results['feature_importance'].tolist() if results['feature_importance'] is not None else None,
-                    'training_info': {
-                        'model_type': model_type,
-                        'test_size': test_size,
-                        'random_state': random_state,
-                        'n_features': len(feature_names),
-                        'n_samples': len(X)
-                    }
-                }
-                
+                # Save active model report (report_data already defined above for versioning)
                 with open("models/report.json", 'w') as f:
                     json.dump(report_data, f, indent=2)
                 
                 # Display results
                 st.success("Model training completed!")
                 
-                col1, col2 = st.columns(2)
+                # Prominently display overall accuracy
+                st.markdown("### 🎯 Model Performance Summary")
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("Overall Accuracy", f"{results['accuracy']:.3f}")
+                    st.metric("**Overall Accuracy**", f"{results['accuracy']:.1%}", help="Overall classification accuracy on test set")
                     
                 with col2:
                     # Get per-class metrics from classification report
@@ -181,6 +481,11 @@ def train_model_page():
                     if 'Confirmed' in class_report:
                         confirmed_f1 = class_report['Confirmed']['f1-score']
                         st.metric("Confirmed F1-Score", f"{confirmed_f1:.3f}")
+                
+                with col3:
+                    if 'macro avg' in class_report:
+                        macro_f1 = class_report['macro avg']['f1-score']
+                        st.metric("Macro F1-Score", f"{macro_f1:.3f}")
                 
                 # Show detailed classification report
                 st.subheader("📊 Classification Report")
@@ -201,6 +506,22 @@ def train_model_page():
                 ax.set_ylabel('True Label')
                 ax.set_xlabel('Predicted Label')
                 st.pyplot(fig)
+                
+                # Show version history
+                if os.path.exists("models/version_history.json"):
+                    with st.expander("📜 Model Version History"):
+                        with open("models/version_history.json", 'r') as f:
+                            history = json.load(f)
+                        
+                        if len(history) > 0:
+                            history_df = pd.DataFrame(history)
+                            history_df = history_df.sort_values('timestamp', ascending=False)
+                            st.dataframe(history_df)
+                            
+                            # Highlight best model
+                            best_idx = history_df['accuracy'].idxmax()
+                            best_model = history_df.loc[best_idx]
+                            st.success(f"🏆 Best model: {best_model['timestamp']} (Accuracy: {best_model['accuracy']:.3f})")
                 
             except Exception as e:
                 st.error(f"Training failed: {str(e)}")
@@ -434,8 +755,17 @@ def model_performance_page():
     
     report = artifacts['report']
     
+    # Display overall accuracy prominently at the top
+    st.markdown("## 🎯 Overall Model Accuracy")
+    accuracy_col1, accuracy_col2, accuracy_col3 = st.columns([2, 1, 1])
+    with accuracy_col1:
+        st.markdown(f"<h1 style='text-align: center; color: #1f77b4;'>{report['overall_accuracy']:.1%}</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>Classification Accuracy on Test Set</p>", unsafe_allow_html=True)
+    
+    st.divider()
+    
     # Overall metrics
-    st.subheader("🎯 Overall Performance")
+    st.subheader("📊 Detailed Performance Metrics")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -553,6 +883,56 @@ def model_performance_page():
         fig.update_traces(text=conf_matrix, texttemplate="%{text}")
         fig.update_xaxis(side="bottom")
         st.plotly_chart(fig)
+    
+    # Calibration and Threshold Analysis
+    st.subheader("📐 Model Calibration & Threshold Tuning")
+    
+    # Load test data and model if available
+    if os.path.exists("models/test_data.joblib") and os.path.exists("models/model.joblib"):
+        try:
+            test_data = joblib.load("models/test_data.joblib")
+            model = artifacts['model']
+            
+            calibration = ModelCalibration(
+                model,
+                test_data['X_test'],
+                test_data['y_test'],
+                artifacts['labels']
+            )
+            
+            # Show saved threshold recommendations
+            if 'calibration_thresholds' in report and report['calibration_thresholds']:
+                st.markdown("#### 🎯 Recommended Probability Thresholds")
+                thresh_df = pd.DataFrame(report['calibration_thresholds']).T
+                st.dataframe(thresh_df)
+            
+            # Interactive calibration analysis
+            with st.expander("📊 View Calibration Curves", expanded=False):
+                # Select class for detailed analysis
+                class_idx = st.selectbox(
+                    "Select class for detailed calibration analysis:",
+                    range(len(artifacts['labels'])),
+                    format_func=lambda x: artifacts['labels'][x]
+                )
+                
+                cal_col1, cal_col2 = st.columns(2)
+                
+                with cal_col1:
+                    # Calibration curve
+                    fig_cal, brier = calibration.plot_calibration_curve(class_idx)
+                    st.pyplot(fig_cal)
+                    st.caption(f"Brier Score: {brier:.4f} (lower is better)")
+                
+                with cal_col2:
+                    # Threshold analysis
+                    fig_thresh, opt_thresh = calibration.plot_threshold_analysis(class_idx)
+                    st.pyplot(fig_thresh)
+                    st.caption(f"Optimal F1 threshold: {opt_thresh:.3f}")
+        
+        except Exception as e:
+            st.warning(f"Could not load calibration data: {str(e)}")
+    else:
+        st.info("Calibration analysis will be available after training a model.")
     
     # Training information
     st.subheader("ℹ️ Training Information")
